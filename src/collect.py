@@ -1,5 +1,6 @@
 import pandas as pd
 import random
+import os
 from datetime import datetime, timedelta
 
 TWEETS_DATA = [
@@ -43,5 +44,6 @@ def collect_tweets(query: str, max_results: int = 100) -> pd.DataFrame:
         })
 
     df = pd.DataFrame(records)
+    os.makedirs("data", exist_ok=True)
     df.to_parquet("data/tweets_demo.parquet")
     return df
