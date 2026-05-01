@@ -13,6 +13,7 @@ import re
 import warnings
 import pandas as pd
 import spacy
+import streamlit as st
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import spmatrix
 from typing import Tuple, List, Dict
@@ -21,40 +22,38 @@ warnings.filterwarnings("ignore")
 
 # ─── Chargement des modèles spaCy ────────────────────────────────────────────
 
+@st.cache_resource
 def _load_spacy_models() -> Dict[str, spacy.language.Language]:
     """Charge les modèles spaCy FR et EN (désactive les pipelines inutiles)."""
     models = {}
-    for model_name, lang in [
-        ("fr_core_news_md", "fr"),
-        ("fr_core_news_sm", "fr"),
-    ]:
-        if "fr" in models:
-            break
+    # Ordre de priorité pour le chargement des modèles
+    fr_candidates = ["fr_core_news_md", "fr_core_news_sm"]
+    en_candidates = ["en_core_web_sm", "en_core_web_md"]
+
+    for model_name in fr_candidates:
         try:
+            # Utilisation de spacy.load direct pour la compatibilité package
             models["fr"] = spacy.load(model_name, disable=["parser"])
-        except OSError:
+            break
+        except (OSError, ImportError):
             continue
 
-    for model_name, lang in [
-        ("en_core_web_sm", "en"),
-        ("en_core_web_md", "en"),
-    ]:
-        if "en" in models:
-            break
+    for model_name in en_candidates:
         try:
             models["en"] = spacy.load(model_name, disable=["parser"])
-        except OSError:
+            break
+        except (OSError, ImportError):
             continue
 
     if not models:
         warnings.warn(
             "Aucun modèle spaCy disponible. NER et lemmatisation désactivés. "
-            "Exécutez : python -m spacy download fr_core_news_md && "
-            "python -m spacy download en_core_web_sm"
+            "Assurez-vous que les modèles sont dans requirements.txt"
         )
     return models
 
 
+# Initialisation sécurisée via le cache Streamlit
 _SPACY_MODELS: Dict[str, spacy.language.Language] = _load_spacy_models()
 
 # ─── Détection de langue ──────────────────────────────────────────────────────
@@ -64,18 +63,19 @@ def detect_language(text: str) -> str:
     Détecte la langue d'un texte.
     Retourne 'fr', 'en' ou 'unknown'.
     """
-    if not text or len(text.strip()) < 10:
+    if not text or len(str(text).strip()) < 10:
         return "unknown"
     try:
-        from langdetect import detect, LangDetectException
+        from langdetect import detect
         lang = detect(text)
         return lang if lang in ("fr", "en") else "other"
     except Exception:
         pass
+    
     # Heuristique de secours
     fr_markers = {"le", "la", "les", "de", "du", "est", "et", "en", "un", "une",
                   "dans", "pour", "que", "qui", "sur", "pas", "je", "vous"}
-    words = set(text.lower().split())
+    words = set(str(text).lower().split())
     if len(words & fr_markers) >= 2:
         return "fr"
     return "en"
@@ -103,7 +103,7 @@ def extract_entities(text: str, lang: str = "fr") -> Dict[str, List[str]]:
 
     try:
         nlp = _SPACY_MODELS[model_key]
-        doc = nlp(text[:1000])
+        doc = nlp(str(text)[:1000])
         for ent in doc.ents:
             label = ent.label_
             value = ent.text.strip()
@@ -144,7 +144,7 @@ def extract_entities_batch(
         if not indices:
             continue
         nlp = _SPACY_MODELS[lang_key]
-        batch_texts = [texts[i][:1000] for i in indices]
+        batch_texts = [str(texts[i])[:1000] for i in indices]
         try:
             for idx, doc in zip(indices, nlp.pipe(batch_texts, batch_size=64)):
                 for ent in doc.ents:
@@ -220,7 +220,7 @@ def _lemmatize(text: str, lang: str) -> str:
 
     try:
         nlp = _SPACY_MODELS[model_key]
-        doc = nlp(text[:2000])
+        doc = nlp(str(text)[:2000])
         tokens = [
             t.lemma_.lower()
             for t in doc
@@ -274,27 +274,18 @@ def preprocess(
 ) -> Tuple[pd.DataFrame, TfidfVectorizer, spmatrix]:
     """
     Pipeline NLP complet.
-
-    FIX — garantit que les colonnes NER ('ner_persons', 'ner_orgs', 'ner_locations')
-    sont TOUJOURS présentes dans le DataFrame retourné, même si spaCy est absent
-    ou si extract_ner=False. Cela évite les KeyError dans visualize.py.
-
-    Returns:
-        (df_enrichi, vectorizer, tfidf_matrix)
     """
     df = df.copy()
 
-    # S'assurer que la colonne text existe
     if "text" not in df.columns:
         raise ValueError("Le DataFrame doit contenir une colonne 'text'.")
 
-    # Remplacer les valeurs manquantes dans text
     df["text"] = df["text"].fillna("").astype(str)
 
     # 1. Détection de langue
     df["lang"] = df["text"].apply(detect_language)
 
-    # 2. NER batch — FIX : toujours créer les colonnes, même vides
+    # 2. NER batch
     if extract_ner and _SPACY_MODELS:
         try:
             entities_list = extract_entities_batch(
@@ -309,7 +300,6 @@ def preprocess(
             df["ner_orgs"]      = [[] for _ in range(len(df))]
             df["ner_locations"] = [[] for _ in range(len(df))]
     else:
-        # FIX — colonnes toujours créées même si NER désactivé
         df["ner_persons"]   = [[] for _ in range(len(df))]
         df["ner_orgs"]      = [[] for _ in range(len(df))]
         df["ner_locations"] = [[] for _ in range(len(df))]
@@ -320,7 +310,6 @@ def preprocess(
         axis=1,
     )
 
-    # FIX — remplacer les clean_text vides par un token générique pour ne pas perdre de posts
     df["clean_text"] = df["clean_text"].apply(
         lambda t: t if t.strip() else "post vide"
     )
@@ -349,7 +338,7 @@ def preprocess(
 
 def get_top_terms(text: str, vectorizer: TfidfVectorizer, top_n: int = 5) -> List[str]:
     """Retourne les top N termes TF-IDF d'un texte donné."""
-    vec = vectorizer.transform([clean_text(text)])
+    vec = vectorizer.transform([clean_text(str(text))])
     indices = vec.toarray()[0].argsort()[-top_n:][::-1]
     return [vectorizer.get_feature_names_out()[i] for i in indices]
 
