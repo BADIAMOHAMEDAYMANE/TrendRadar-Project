@@ -1,35 +1,29 @@
 """
 collect.py — Collecte Reddit via endpoints JSON publics (sans clé API)
-Compatible avec le projet TrendRadar · remplace la version PRAW
+Compatible avec le projet TrendRadar · v2 anti-ban
 """
 
 import os
 import time
+import random
 import requests
 import pandas as pd
 from datetime import datetime
 from typing import Generator, List, Optional, Set
 
-# Headers réalistes pour éviter le blocage Reddit
+# ─── Configuration ────────────────────────────────────────────────────────────
+
 HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Referer": "https://www.reddit.com/",
+    "User-Agent": "TrendRadar/1.0 by u/ton_username",
+    "Accept": "application/json",
 }
 
-BASE_URL      = "https://www.reddit.com"
-REQUEST_DELAY = 2.0  # secondes entre requêtes (~30 req/min max)
-MAX_RETRIES   = 3    # tentatives par URL
+BASE_URL    = "https://api.reddit.com"
+MAX_RETRIES = 3
+CACHE_PATH  = "data/reddit_snapshot.parquet"
 
 
-# ─── Helpers internes ─────────────────────────────────────────────────────────
+# ─── Session persistante ──────────────────────────────────────────────────────
 
 def _build_session() -> requests.Session:
     """Crée une session persistante avec les headers globaux."""
@@ -38,343 +32,247 @@ def _build_session() -> requests.Session:
     return s
 
 
-def _get_with_fallback(
-    url_primary: str,
-    url_fallback: str,
-    params: dict,
-    session: requests.Session,
-) -> dict:
-    """
-    Tente url_primary d'abord, puis url_fallback si 403/404 ou réponse vide.
-    Gère le rate-limiting (429) avec backoff exponentiel.
-    """
-    urls_to_try = [url_primary]
-    if url_fallback and url_fallback != url_primary:
-        urls_to_try.append(url_fallback)
-
-    for url in urls_to_try:
-        current_params = dict(params)
-        if url == url_fallback:
-            current_params.pop("restrict_sr", None)
-
-        for retry in range(MAX_RETRIES):
-            try:
-                resp = session.get(url, params=current_params, timeout=15)
-
-                if resp.status_code == 429:
-                    wait = int(resp.headers.get("Retry-After", 15))
-                    time.sleep(wait)
-                    continue
-
-                if resp.status_code in (403, 404):
-                    time.sleep(REQUEST_DELAY)
-                    break
-
-                resp.raise_for_status()
-                data = resp.json()
-
-                children = data.get("data", {}).get("children", [])
-                if not children and url == url_primary and url_primary != url_fallback:
-                    break
-
-                return data
-
-            except requests.exceptions.Timeout:
-                time.sleep(2 ** retry)
-                continue
-            except requests.exceptions.RequestException as e:
-                raise RuntimeError(f"Erreur réseau : {e}")
-
-    raise RuntimeError(
-        f"Impossible d'obtenir une réponse valide après {MAX_RETRIES} tentatives. "
-        f"URL primaire : {url_primary}"
-    )
+_SESSION = _build_session()
 
 
-# ─── Snapshot batch ───────────────────────────────────────────────────────────
+# ─── Helpers internes ─────────────────────────────────────────────────────────
+
+def _safe_get(url: str, params: dict = None, retries: int = MAX_RETRIES) -> Optional[dict]:
+    """GET avec retry + backoff exponentiel."""
+    for attempt in range(retries):
+        try:
+            resp = _SESSION.get(url, params=params, timeout=15)
+            if resp.status_code == 200:
+                return resp.json()
+            elif resp.status_code == 429:
+                wait = 2 ** attempt + random.uniform(0.5, 1.5)
+                time.sleep(wait)
+            elif resp.status_code in (403, 404):
+                return None
+            else:
+                time.sleep(1)
+        except Exception:
+            time.sleep(1.5)
+    return None
+
+
+def _post_to_dict(post: dict) -> dict:
+    """Convertit un post Reddit brut en dict normalisé."""
+    d = post.get("data", {})
+    created = d.get("created_utc", 0)
+    return {
+        "id":           d.get("id", ""),
+        "title":        d.get("title", ""),
+        "selftext":     d.get("selftext", ""),
+        "text":         (d.get("title", "") + " " + d.get("selftext", "")).strip(),
+        "subreddit":    d.get("subreddit", ""),
+        "score":        int(d.get("score", 0)),
+        "upvote_ratio": float(d.get("upvote_ratio", 0.5)),
+        "num_comments": int(d.get("num_comments", 0)),
+        "flair":        d.get("link_flair_text") or "",
+        "url":          d.get("url", ""),
+        "permalink":    "https://reddit.com" + d.get("permalink", ""),
+        "created_at":   pd.Timestamp(created, unit="s", tz="UTC") if created else pd.NaT,
+        "author":       d.get("author", "[deleted]"),
+        "is_video":     bool(d.get("is_video", False)),
+        "over_18":      bool(d.get("over_18", False)),
+    }
+
+
+# ─── Collecte principale ──────────────────────────────────────────────────────
 
 def fetch_posts(
     subreddits: str,
     query: str,
-    max_results: int = 200,
-    sort: str = "new",
+    limit: int = 150,
+    sort: str = "relevance",
     time_filter: str = "week",
 ) -> pd.DataFrame:
     """
-    Collecte des posts Reddit en mode snapshot via l'API JSON publique.
+    Recherche des posts Reddit via l'API JSON publique.
+
+    Args:
+        subreddits : subreddits séparés par '+' (ex: "france+French")
+        query      : mots-clés de recherche
+        limit      : nombre max de posts à récupérer
+        sort       : "relevance" | "new" | "hot" | "top"
+        time_filter: "day" | "week" | "month" | "year" (pour sort=top)
+
+    Returns:
+        DataFrame normalisé
     """
-    records = []
-    after   = None
-    session = _build_session()
+    posts    = []
+    after    = None
+    batch    = min(100, limit)
+    seen_ids: Set[str] = set()
 
-    if subreddits.lower() == "all":
-        url_primary  = f"{BASE_URL}/search.json"
-        url_fallback = url_primary
-    else:
-        url_primary  = f"{BASE_URL}/r/{subreddits}/search.json"
-        url_fallback = f"{BASE_URL}/search.json"
+    sub_path = subreddits if subreddits else "all"
+    url      = f"{BASE_URL}/r/{sub_path}/search.json"
 
-    while len(records) < max_results:
-        batch_size = min(100, max_results - len(records))
+    while len(posts) < limit:
         params = {
-            "q":           query.strip(),
-            "sort":        sort,
-            "t":           time_filter,
-            "limit":       batch_size,
+            "q":          query,
+            "sort":       sort,
+            "t":          time_filter,
+            "limit":      batch,
             "restrict_sr": "true",
         }
         if after:
             params["after"] = after
 
-        try:
-            data = _get_with_fallback(url_primary, url_fallback, params, session)
-        except RuntimeError as e:
-            raise RuntimeError(f"fetch_posts échoué : {e}")
+        data = _safe_get(url, params)
+        if not data:
+            break
 
         children = data.get("data", {}).get("children", [])
         if not children:
             break
 
         for child in children:
-            records.append(_post_to_dict(child.get("data", {})))
+            post = _post_to_dict(child)
+            if post["id"] not in seen_ids and post["text"].strip():
+                seen_ids.add(post["id"])
+                posts.append(post)
 
         after = data.get("data", {}).get("after")
-        if not after:
+        if not after or len(posts) >= limit:
             break
 
-        time.sleep(REQUEST_DELAY)
+        time.sleep(random.uniform(0.8, 1.5))
 
-    if not records:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(records)
-    _save_parquet(df)
+    df = pd.DataFrame(posts[:limit])
+    if not df.empty:
+        _save_cache(df)
     return df
 
 
 def fetch_subreddit_posts(
     subreddit: str,
-    sort: str = "new",
+    sort: str = "hot",
     limit: int = 100,
+    time_filter: str = "week",
 ) -> pd.DataFrame:
     """
-    Récupère les posts d'un subreddit sans recherche par mot-clé.
+    Récupère les posts d'un subreddit spécifique sans query de recherche.
+
+    Args:
+        subreddit  : nom du subreddit (sans r/)
+        sort       : "hot" | "new" | "top" | "rising"
+        limit      : nombre max de posts
+        time_filter: utilisé si sort="top"
+
+    Returns:
+        DataFrame normalisé
     """
-    session = _build_session()
-    records = []
-    after   = None
+    posts    = []
+    after    = None
+    batch    = min(100, limit)
+    seen_ids: Set[str] = set()
 
-    sort_fallbacks = [sort]
-    if sort != "new":
-        sort_fallbacks.append("new")
+    url = f"{BASE_URL}/r/{subreddit}/{sort}.json"
 
-    url_primary  = f"{BASE_URL}/r/{subreddit}/{sort_fallbacks[0]}.json"
-    url_fallback = (
-        f"{BASE_URL}/r/{subreddit}/{sort_fallbacks[1]}.json"
-        if len(sort_fallbacks) > 1
-        else f"{BASE_URL}/r/{subreddit}/new.json"
-    )
-
-    while len(records) < limit:
-        params = {"limit": min(100, limit - len(records))}
+    while len(posts) < limit:
+        params: dict = {"limit": batch}
+        if sort == "top":
+            params["t"] = time_filter
         if after:
             params["after"] = after
 
-        try:
-            data = _get_with_fallback(url_primary, url_fallback, params, session)
-        except RuntimeError as e:
-            raise RuntimeError(f"fetch_subreddit_posts échoué : {e}")
+        data = _safe_get(url, params)
+        if not data:
+            break
 
         children = data.get("data", {}).get("children", [])
         if not children:
             break
 
         for child in children:
-            records.append(_post_to_dict(child.get("data", {})))
+            post = _post_to_dict(child)
+            if post["id"] not in seen_ids and post["text"].strip():
+                seen_ids.add(post["id"])
+                posts.append(post)
 
         after = data.get("data", {}).get("after")
-        if not after:
+        if not after or len(posts) >= limit:
             break
 
-        time.sleep(REQUEST_DELAY)
+        time.sleep(random.uniform(0.8, 1.5))
 
-    df = pd.DataFrame(records) if records else pd.DataFrame()
+    df = pd.DataFrame(posts[:limit])
     if not df.empty:
-        _save_parquet(df)
+        _save_cache(df)
     return df
 
 
-# ─── Streaming par polling (SANS CLÉ API) ────────────────────────────────────
+# ─── Streaming (polling) ──────────────────────────────────────────────────────
 
 def stream_posts(
     subreddits: str,
     keywords: Optional[List[str]] = None,
-    max_posts: int = 100,
-    poll_interval: int = 10,  # CORRIGÉ : 10s au lieu de 30s
+    max_posts: int = 200,
+    poll_interval: int = 10,
 ) -> Generator[dict, None, None]:
     """
-    Streaming Reddit par polling sur /new.json — SANS clé API.
-
-    Corrections v2 :
-      - poll_interval par défaut réduit à 10s (au lieu de 30s)
-      - keywords = None accepte TOUS les posts (plus de filtre silencieux)
-      - Si keywords fournis, filtre sur la phrase entière (pas mot par mot)
-      - Fallback automatique sur 3 niveaux d'URLs
-
-    Stratégie de fallback automatique (3 niveaux) :
-      1. /r/sub1+sub2+.../new.json  — multi-subreddit
-      2. /r/{premier_subreddit}/new.json — subreddit unique
-      3. /new.json — front page Reddit globale
+    Générateur qui poll Reddit toutes les `poll_interval` secondes
+    et yield les nouveaux posts.
 
     Args:
-        subreddits   : subreddits à surveiller, ex. "france+MachineLearning"
-        keywords     : liste de phrases à filtrer (None = tout accepter).
-                       Chaque élément est cherché comme phrase complète (OR logique).
-                       Ex: ["AI", "machine learning"] accepte tout post contenant l'un ou l'autre.
-        max_posts    : nombre max de posts nouveaux à collecter
-        poll_interval: secondes entre chaque poll (min recommandé : 10s)
-
-    Yields:
-        dict d'un post Reddit normalisé
+        subreddits    : subreddits séparés par '+'
+        keywords      : filtre optionnel (liste de mots-clés)
+        max_posts     : nombre total max avant arrêt
+        poll_interval : secondes entre chaque requête
     """
-    seen_ids:           Set[str] = set()
-    collected:          int      = 0
-    consecutive_errors: int      = 0
-    MAX_CONSECUTIVE_ERRORS       = 5
+    seen_ids: Set[str] = set()
+    count    = 0
+    sub_path = subreddits if subreddits else "all"
+    url      = f"{BASE_URL}/r/{sub_path}/new.json"
 
-    session = _build_session()
-
-    # ── Construction de la liste de fallback ──────────────────────────────────
-    sub_list   = [s.strip() for s in subreddits.split("+") if s.strip()]
-    url_multi  = f"{BASE_URL}/r/{'+'.join(sub_list)}/new.json"
-    url_single = f"{BASE_URL}/r/{sub_list[0]}/new.json" if sub_list else None
-    url_global = f"{BASE_URL}/new.json"
-
-    candidate_urls = [url_multi]
-    if url_single and url_single != url_multi:
-        candidate_urls.append(url_single)
-    candidate_urls.append(url_global)
-
-    active_url_index = 0
-
-    # ── Normalisation des keywords ────────────────────────────────────────────
-    # On conserve les phrases entières en minuscules pour le filtre
-    normalized_keywords = None
-    if keywords:
-        normalized_keywords = [kw.lower().strip() for kw in keywords if kw.strip()]
-        if not normalized_keywords:
-            normalized_keywords = None
-
-    # ── Boucle de polling ─────────────────────────────────────────────────────
-    while collected < max_posts:
-        url = candidate_urls[active_url_index]
-
-        try:
-            resp = session.get(url, params={"limit": 100}, timeout=15)
-
-            # Rate-limit → attendre le délai indiqué par Reddit
-            if resp.status_code == 429:
-                wait = int(resp.headers.get("Retry-After", 30))
-                time.sleep(wait)
-                continue
-
-            # Blocage ou subreddit introuvable → URL suivante
-            if resp.status_code in (403, 404):
-                if active_url_index < len(candidate_urls) - 1:
-                    active_url_index += 1
-                time.sleep(REQUEST_DELAY)
-                continue
-
-            resp.raise_for_status()
-            data     = resp.json()
-            children = data.get("data", {}).get("children", [])
-
-            # Réponse vide → URL suivante
-            if not children:
-                if active_url_index < len(candidate_urls) - 1:
-                    active_url_index += 1
-                time.sleep(REQUEST_DELAY)
-                continue
-
-            # Succès → réinitialiser le compteur d'erreurs
-            consecutive_errors = 0
-
-            # ── Traitement des posts reçus ────────────────────────────────────
-            new_this_round = 0
-            for child in children:
-                p       = child.get("data", {})
-                post_id = p.get("id", "")
-
-                if not post_id or post_id in seen_ids:
-                    continue
-                seen_ids.add(post_id)
-
-                post_dict = _post_to_dict(p)
-
-                # CORRIGÉ : filtre sur phrase entière (OR logique entre keywords)
-                # Si normalized_keywords est None → on accepte tout
-                if normalized_keywords:
-                    text = post_dict["text"].lower()
-                    if not any(kw in text for kw in normalized_keywords):
-                        continue
-
-                yield post_dict
-                collected      += 1
-                new_this_round += 1
-
-                if collected >= max_posts:
-                    return
-
-            # Adapter le délai : doubler si aucun nouveau post
-            sleep_time = poll_interval
-            time.sleep(sleep_time)
-
-        except requests.exceptions.Timeout:
-            consecutive_errors += 1
-            time.sleep(min(2 ** consecutive_errors, 60))
-
-        except requests.exceptions.RequestException:
-            consecutive_errors += 1
-            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
-                if active_url_index < len(candidate_urls) - 1:
-                    active_url_index += 1
-                consecutive_errors = 0
-            time.sleep(min(2 ** consecutive_errors, 60))
-
-        except Exception:
+    while count < max_posts:
+        data = _safe_get(url, {"limit": 100})
+        if not data:
             time.sleep(poll_interval)
             continue
+
+        children = data.get("data", {}).get("children", [])
+        for child in children:
+            post = _post_to_dict(child)
+            if post["id"] in seen_ids or not post["text"].strip():
+                continue
+
+            # Filtre optionnel par mots-clés
+            if keywords:
+                text_lower = post["text"].lower()
+                if not any(kw.lower() in text_lower for kw in keywords):
+                    continue
+
+            seen_ids.add(post["id"])
+            yield post
+            count += 1
+            if count >= max_posts:
+                return
+
+        time.sleep(poll_interval)
 
 
 # ─── Cache ────────────────────────────────────────────────────────────────────
 
-def load_cached(path: str = "data/reddit_snapshot.parquet") -> Optional[pd.DataFrame]:
-    """Charge le dernier snapshot sauvegardé."""
-    if os.path.exists(path):
-        return pd.read_parquet(path)
-    return None
+def _save_cache(df: pd.DataFrame) -> None:
+    """Sauvegarde le DataFrame en cache Parquet."""
+    try:
+        os.makedirs("data", exist_ok=True)
+        df.to_parquet(CACHE_PATH, index=False)
+    except Exception:
+        pass
 
 
-# ─── Helpers internes ─────────────────────────────────────────────────────────
-
-def _save_parquet(df: pd.DataFrame, path: str = "data/reddit_snapshot.parquet") -> None:
-    """Sauvegarde le DataFrame en Parquet."""
-    os.makedirs("data", exist_ok=True)
-    df.to_parquet(path, index=False)
-
-
-def _post_to_dict(p: dict) -> dict:
-    """Normalise un post brut Reddit en dict standardisé."""
-    return {
-        "id":           p.get("id", ""),
-        "title":        p.get("title", ""),
-        "text":         (p.get("title", "") + " " + p.get("selftext", "")).strip()[:1000],
-        "subreddit":    p.get("subreddit", ""),
-        "author":       p.get("author", "[deleted]"),
-        "created_at":   datetime.utcfromtimestamp(p.get("created_utc", 0)),
-        "score":        p.get("score", 0),
-        "upvote_ratio": p.get("upvote_ratio", 0.0),
-        "num_comments": p.get("num_comments", 0),
-        "url":          "https://reddit.com" + p.get("permalink", ""),
-        "flair":        p.get("link_flair_text") or "",
-    }
+def load_cached() -> Optional[pd.DataFrame]:
+    """
+    Charge le cache Parquet si disponible.
+    Retourne None si aucun cache n'existe.
+    """
+    if not os.path.exists(CACHE_PATH):
+        return None
+    try:
+        return pd.read_parquet(CACHE_PATH)
+    except Exception:
+        return None

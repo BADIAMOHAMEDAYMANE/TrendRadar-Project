@@ -1,41 +1,261 @@
 """
 preprocess.py — Nettoyage NLP et vectorisation TF-IDF pour posts Reddit
+Utilise spaCy (fr_core_news_md + en_core_web_sm) pour :
+  - Détection de langue (langdetect)
+  - Lemmatisation
+  - Extraction d'entités nommées (NER) : personnes, organisations, lieux
+
+FIX — colonnes NER ('ner_persons', 'ner_orgs', 'ner_locations') TOUJOURS créées,
+même si spaCy est absent, pour éviter les KeyError dans app.py et visualize.py.
 """
 
 import re
+import warnings
 import pandas as pd
-import nltk
-from nltk.corpus import stopwords
+import spacy
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import spmatrix
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 
-nltk.download("stopwords", quiet=True)
+warnings.filterwarnings("ignore")
 
-STOPWORDS = (
-    set(stopwords.words("french"))
-    | set(stopwords.words("english"))
-    | {
-        # Bruit typique Reddit
-        "https", "http", "www", "reddit", "post", "edit", "update",
-        "deleted", "removed", "comment", "amp", "nbsp", "quot",
-    }
-)
+# ─── Chargement des modèles spaCy ────────────────────────────────────────────
+
+def _load_spacy_models() -> Dict[str, spacy.language.Language]:
+    """Charge les modèles spaCy FR et EN (désactive les pipelines inutiles)."""
+    models = {}
+    for model_name, lang in [
+        ("fr_core_news_md", "fr"),
+        ("fr_core_news_sm", "fr"),
+    ]:
+        if "fr" in models:
+            break
+        try:
+            models["fr"] = spacy.load(model_name, disable=["parser"])
+        except OSError:
+            continue
+
+    for model_name, lang in [
+        ("en_core_web_sm", "en"),
+        ("en_core_web_md", "en"),
+    ]:
+        if "en" in models:
+            break
+        try:
+            models["en"] = spacy.load(model_name, disable=["parser"])
+        except OSError:
+            continue
+
+    if not models:
+        warnings.warn(
+            "Aucun modèle spaCy disponible. NER et lemmatisation désactivés. "
+            "Exécutez : python -m spacy download fr_core_news_md && "
+            "python -m spacy download en_core_web_sm"
+        )
+    return models
 
 
-# ─── Nettoyage ────────────────────────────────────────────────────────────────
+_SPACY_MODELS: Dict[str, spacy.language.Language] = _load_spacy_models()
 
-def clean_text(text: str) -> str:
+# ─── Détection de langue ──────────────────────────────────────────────────────
+
+def detect_language(text: str) -> str:
     """
-    Supprime URLs, mentions, ponctuation et stopwords.
-    Conserve accents français et mots >2 caractères.
+    Détecte la langue d'un texte.
+    Retourne 'fr', 'en' ou 'unknown'.
     """
-    if not isinstance(text, str):
+    if not text or len(text.strip()) < 10:
+        return "unknown"
+    try:
+        from langdetect import detect, LangDetectException
+        lang = detect(text)
+        return lang if lang in ("fr", "en") else "other"
+    except Exception:
+        pass
+    # Heuristique de secours
+    fr_markers = {"le", "la", "les", "de", "du", "est", "et", "en", "un", "une",
+                  "dans", "pour", "que", "qui", "sur", "pas", "je", "vous"}
+    words = set(text.lower().split())
+    if len(words & fr_markers) >= 2:
+        return "fr"
+    return "en"
+
+
+# ─── Extraction NER ───────────────────────────────────────────────────────────
+
+def extract_entities(text: str, lang: str = "fr") -> Dict[str, List[str]]:
+    """
+    Extrait les entités nommées (PER, ORG, LOC/GPE) d'un texte via spaCy.
+    Retourne toujours le même dict même si spaCy est absent.
+    """
+    entities: Dict[str, List[str]] = {"persons": [], "organizations": [], "locations": []}
+
+    if not _SPACY_MODELS:
+        return entities
+
+    model_key = lang if lang in _SPACY_MODELS else (
+        "fr" if "fr" in _SPACY_MODELS else (
+            "en" if "en" in _SPACY_MODELS else None
+        )
+    )
+    if model_key is None:
+        return entities
+
+    try:
+        nlp = _SPACY_MODELS[model_key]
+        doc = nlp(text[:1000])
+        for ent in doc.ents:
+            label = ent.label_
+            value = ent.text.strip()
+            if not value:
+                continue
+            if label in ("PER", "PERSON"):
+                entities["persons"].append(value)
+            elif label in ("ORG",):
+                entities["organizations"].append(value)
+            elif label in ("LOC", "GPE", "FAC"):
+                entities["locations"].append(value)
+    except Exception:
+        pass
+
+    return entities
+
+
+def extract_entities_batch(
+    texts: List[str],
+    langs: List[str],
+) -> List[Dict[str, List[str]]]:
+    """
+    Extraction NER en batch.
+    FIX — retourne toujours une liste de la bonne taille,
+    même si spaCy est absent ou plante.
+    """
+    results: List[Dict[str, List[str]]] = [
+        {"persons": [], "organizations": [], "locations": []} for _ in texts
+    ]
+
+    if not _SPACY_MODELS:
+        return results
+
+    for lang_key in ("fr", "en"):
+        if lang_key not in _SPACY_MODELS:
+            continue
+        indices = [i for i, l in enumerate(langs) if l == lang_key]
+        if not indices:
+            continue
+        nlp = _SPACY_MODELS[lang_key]
+        batch_texts = [texts[i][:1000] for i in indices]
+        try:
+            for idx, doc in zip(indices, nlp.pipe(batch_texts, batch_size=64)):
+                for ent in doc.ents:
+                    label, value = ent.label_, ent.text.strip()
+                    if not value:
+                        continue
+                    if label in ("PER", "PERSON"):
+                        results[idx]["persons"].append(value)
+                    elif label in ("ORG",):
+                        results[idx]["organizations"].append(value)
+                    elif label in ("LOC", "GPE", "FAC"):
+                        results[idx]["locations"].append(value)
+        except Exception:
+            # En cas d'erreur batch, fallback post par post
+            for i, idx in enumerate(indices):
+                try:
+                    doc = nlp(batch_texts[i])
+                    for ent in doc.ents:
+                        label, value = ent.label_, ent.text.strip()
+                        if not value:
+                            continue
+                        if label in ("PER", "PERSON"):
+                            results[idx]["persons"].append(value)
+                        elif label in ("ORG",):
+                            results[idx]["organizations"].append(value)
+                        elif label in ("LOC", "GPE", "FAC"):
+                            results[idx]["locations"].append(value)
+                except Exception:
+                    pass
+
+    return results
+
+
+# ─── Stopwords étendus ────────────────────────────────────────────────────────
+
+_FR_STOPS: set = set()
+_EN_STOPS: set = set()
+
+try:
+    import nltk
+    nltk.download("stopwords", quiet=True)
+    from nltk.corpus import stopwords
+    _FR_STOPS = set(stopwords.words("french"))
+    _EN_STOPS = set(stopwords.words("english"))
+except Exception:
+    pass
+
+if "fr" in _SPACY_MODELS:
+    _FR_STOPS |= _SPACY_MODELS["fr"].Defaults.stop_words
+if "en" in _SPACY_MODELS:
+    _EN_STOPS |= _SPACY_MODELS["en"].Defaults.stop_words
+
+STOPWORDS = _FR_STOPS | _EN_STOPS | {
+    "https", "http", "www", "reddit", "post", "edit", "update",
+    "deleted", "removed", "comment", "amp", "nbsp", "quot",
+}
+
+
+# ─── Lemmatisation spaCy ──────────────────────────────────────────────────────
+
+def _lemmatize(text: str, lang: str) -> str:
+    """Lemmatise un texte avec le modèle spaCy correspondant."""
+    if not _SPACY_MODELS:
+        return text
+
+    model_key = lang if lang in _SPACY_MODELS else (
+        "fr" if "fr" in _SPACY_MODELS else (
+            "en" if "en" in _SPACY_MODELS else None
+        )
+    )
+    if model_key is None:
+        return text
+
+    try:
+        nlp = _SPACY_MODELS[model_key]
+        doc = nlp(text[:2000])
+        tokens = [
+            t.lemma_.lower()
+            for t in doc
+            if not t.is_stop
+            and not t.is_punct
+            and not t.is_space
+            and len(t.lemma_) > 2
+            and t.lemma_.lower() not in STOPWORDS
+        ]
+        return " ".join(tokens)
+    except Exception:
+        return text
+
+
+# ─── Nettoyage de base ────────────────────────────────────────────────────────
+
+def clean_text(text: str, lemmatize: bool = False, lang: str = "fr") -> str:
+    """
+    Nettoie un texte Reddit.
+    FIX — robuste face aux valeurs None/NaN.
+    """
+    if not isinstance(text, str) or not text.strip():
         return ""
-    text = re.sub(r"http\S+|www\S+", "", text)               # URLs
-    text = re.sub(r"u/\w+|r/\w+", "", text)                  # u/user  r/sub
-    text = re.sub(r"@\w+|#\w+", "", text)                    # mentions / hashtags
-    text = re.sub(r"[^a-zA-ZÀ-ÿ\s]", " ", text)              # ponctuation / chiffres
+    text = re.sub(r"http\S+|www\S+", "", text)
+    text = re.sub(r"u/\w+|r/\w+", "", text)
+    text = re.sub(r"@\w+|#\w+", "", text)
+    text = re.sub(r"[^a-zA-ZÀ-ÿ\s]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return ""
+
+    if lemmatize and _SPACY_MODELS:
+        return _lemmatize(text, lang)
+
     tokens = [
         w.lower() for w in text.split()
         if w.lower() not in STOPWORDS and len(w) > 2
@@ -49,38 +269,75 @@ def preprocess(
     df: pd.DataFrame,
     max_features: int = 500,
     ngram_range: Tuple[int, int] = (1, 2),
+    extract_ner: bool = True,
+    lemmatize: bool = True,
 ) -> Tuple[pd.DataFrame, TfidfVectorizer, spmatrix]:
     """
-    Nettoie les textes et construit la matrice TF-IDF.
+    Pipeline NLP complet.
 
-    Args:
-        df           : DataFrame avec colonne 'text'
-        max_features : nombre max de features TF-IDF
-        ngram_range  : plage de n-grams
+    FIX — garantit que les colonnes NER ('ner_persons', 'ner_orgs', 'ner_locations')
+    sont TOUJOURS présentes dans le DataFrame retourné, même si spaCy est absent
+    ou si extract_ner=False. Cela évite les KeyError dans visualize.py.
 
     Returns:
-        (df_clean, vectorizer, tfidf_matrix)
+        (df_enrichi, vectorizer, tfidf_matrix)
     """
     df = df.copy()
-    df["clean_text"] = df["text"].apply(clean_text)
 
-    # Supprimer les posts vides après nettoyage
+    # S'assurer que la colonne text existe
+    if "text" not in df.columns:
+        raise ValueError("Le DataFrame doit contenir une colonne 'text'.")
+
+    # Remplacer les valeurs manquantes dans text
+    df["text"] = df["text"].fillna("").astype(str)
+
+    # 1. Détection de langue
+    df["lang"] = df["text"].apply(detect_language)
+
+    # 2. NER batch — FIX : toujours créer les colonnes, même vides
+    if extract_ner and _SPACY_MODELS:
+        try:
+            entities_list = extract_entities_batch(
+                df["text"].tolist(),
+                df["lang"].tolist(),
+            )
+            df["ner_persons"]   = [e["persons"]       for e in entities_list]
+            df["ner_orgs"]      = [e["organizations"] for e in entities_list]
+            df["ner_locations"] = [e["locations"]      for e in entities_list]
+        except Exception:
+            df["ner_persons"]   = [[] for _ in range(len(df))]
+            df["ner_orgs"]      = [[] for _ in range(len(df))]
+            df["ner_locations"] = [[] for _ in range(len(df))]
+    else:
+        # FIX — colonnes toujours créées même si NER désactivé
+        df["ner_persons"]   = [[] for _ in range(len(df))]
+        df["ner_orgs"]      = [[] for _ in range(len(df))]
+        df["ner_locations"] = [[] for _ in range(len(df))]
+
+    # 3. Nettoyage + lemmatisation
+    df["clean_text"] = df.apply(
+        lambda row: clean_text(row["text"], lemmatize=lemmatize, lang=row["lang"]),
+        axis=1,
+    )
+
+    # FIX — remplacer les clean_text vides par un token générique pour ne pas perdre de posts
+    df["clean_text"] = df["clean_text"].apply(
+        lambda t: t if t.strip() else "post vide"
+    )
+
     df = df[df["clean_text"].str.strip().str.len() > 0].reset_index(drop=True)
 
     if df.empty:
         raise ValueError("Aucun post utilisable après nettoyage NLP.")
 
+    # 4. TF-IDF
     n_docs = len(df)
-
-    # min_df adaptatif : exige qu'un terme apparaisse dans au moins 2 docs,
-    # mais seulement si le corpus est assez grand pour le permettre.
-    # En dessous de 10 docs, on accepte tous les termes (min_df=1).
     min_df = 2 if n_docs >= 10 else 1
 
     vectorizer = TfidfVectorizer(
         max_features=max_features,
         ngram_range=ngram_range,
-        sublinear_tf=True,   # atténue les termes très fréquents
+        sublinear_tf=True,
         min_df=min_df,
     )
     matrix = vectorizer.fit_transform(df["clean_text"])
@@ -88,8 +345,21 @@ def preprocess(
     return df, vectorizer, matrix
 
 
+# ─── Utilitaires ──────────────────────────────────────────────────────────────
+
 def get_top_terms(text: str, vectorizer: TfidfVectorizer, top_n: int = 5) -> List[str]:
-    """Retourne les top N termes TF-IDF d'un texte donné (pour debug/affichage)."""
+    """Retourne les top N termes TF-IDF d'un texte donné."""
     vec = vectorizer.transform([clean_text(text)])
     indices = vec.toarray()[0].argsort()[-top_n:][::-1]
     return [vectorizer.get_feature_names_out()[i] for i in indices]
+
+
+def get_all_locations(df: pd.DataFrame) -> List[str]:
+    """Extrait tous les lieux détectés par NER dans le DataFrame."""
+    if "ner_locations" not in df.columns:
+        return []
+    locs = []
+    for loc_list in df["ner_locations"]:
+        if isinstance(loc_list, list):
+            locs.extend(loc_list)
+    return locs
