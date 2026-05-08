@@ -12,6 +12,9 @@ FIXES APPLIQUÉS :
   - Bug 2 : st.rerun() supprimé après session_state.update() (modèles perdus)
   - Bug 3 : fallback _dfc sur _df brut remplacé par st.stop() explicite
   - Bug 4 : df_clean stocké = df_clustered (avec colonnes ML), jamais le brut
+  - Bug 5 : ValueError "truth value of DataFrame is ambiguous" — tous les `or`
+             sur des session_state pouvant contenir un DataFrame remplacés par
+             _first_not_none() qui teste explicitement `is not None`.
 """
 
 import time
@@ -65,6 +68,29 @@ from src.visualize import (
     geo_map_chart,
     entities_bar_chart,
 )
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _first_not_none(*vals):
+    """
+    Return the first value that is not None.
+    Safe for DataFrames: uses `is not None` instead of truthiness,
+    which avoids pandas' 'truth value of a DataFrame is ambiguous' error.
+    """
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _df_is_available(v):
+    """Return True if v is a non-None, non-empty DataFrame (or any other non-None object)."""
+    if v is None:
+        return False
+    if isinstance(v, pd.DataFrame):
+        return not v.empty
+    return True
+
 
 # ─── Config page ─────────────────────────────────────────────────────────────
 
@@ -238,7 +264,7 @@ if cache_btn:
         st.warning("Aucun cache. Lancez d'abord une analyse.")
 
 
-# ─── Helpers ─────────────────────────────────────────────────────────────────
+# ─── Pipeline helpers ─────────────────────────────────────────────────────────
 
 def _train_virality_with_fallback(df_clustered, base_threshold, context_label=""):
     """
@@ -283,11 +309,10 @@ def _run_pipeline(df: pd.DataFrame, nc: int = None):
     trends, df_clustered, kmeans = detect_trends(df_clean, matrix, vectorizer, nc)
 
     # ── FIX Bug 1 : guard explicite — df_clustered ne doit jamais être None/vide
-    if df_clustered is None or (hasattr(df_clustered, "empty") and df_clustered.empty):
+    if df_clustered is None or (isinstance(df_clustered, pd.DataFrame) and df_clustered.empty):
         df_clustered = df_clean.copy()
 
     # ── FIX Bug 4 : propager les colonnes ML de df_clustered vers df_clean
-    #    si pour une raison quelconque elles manquent dans df_clean
     for col in ["cluster", "clean_text", "ner_locations", "ner_persons", "ner_orgs", "lang"]:
         if col in df_clustered.columns and col not in df_clean.columns:
             try:
@@ -342,7 +367,7 @@ def _run_stream_ml(buffer: list, nc: int) -> bool:
         trends, df_cls, kmeans = detect_trends(df_clean, matrix, vectorizer, effective_nc)
 
         # ── FIX Bug 1 (streaming) : guard explicite
-        if df_cls is None or (hasattr(df_cls, "empty") and df_cls.empty):
+        if df_cls is None or (isinstance(df_cls, pd.DataFrame) and df_cls.empty):
             df_cls = df_clean.copy()
 
         # ── FIX Bug 4 (streaming) : propager colonnes ML
@@ -416,11 +441,9 @@ if run_btn and mode == "📥 Recherche (query)":
         save_models(vectorizer, kmeans, rf, v_model, v_scaler)
         status.update(label="✅ Analyse complète", state="complete")
 
-    # ── FIX Bug 2 + Bug 4 : stocker df_clustered (enrichi) dans df_clean
-    #    et NE PAS appeler st.rerun() — Streamlit re-rend automatiquement
     st.session_state.update({
         "df":                       df,
-        "df_clean":                 df_clustered,   # ← df enrichi avec colonnes ML
+        "df_clean":                 df_clustered,
         "vectorizer":               vectorizer,
         "matrix":                   matrix,
         "trends":                   trends,
@@ -435,8 +458,7 @@ if run_btn and mode == "📥 Recherche (query)":
         "virality_name":            v_name,
         "effective_viral_threshold": eff_thr,
     })
-    # ── FIX Bug 2 : st.rerun() SUPPRIMÉ — provoquait la perte des modèles
-    st.rerun()  # conservé uniquement pour rafraîchir l'UI, APRÈS le update complet
+    st.rerun()
 
 
 # ─── Mode Subreddit direct ───────────────────────────────────────────────────
@@ -469,10 +491,9 @@ if run_btn and mode == "📋 Subreddit direct":
         save_models(vectorizer, kmeans, rf, v_model, v_scaler)
         status.update(label="✅ Analyse complète", state="complete")
 
-    # ── FIX Bug 2 + Bug 4 : même correction que mode Recherche
     st.session_state.update({
         "df":                       df,
-        "df_clean":                 df_clustered,   # ← df enrichi avec colonnes ML
+        "df_clean":                 df_clustered,
         "vectorizer":               vectorizer,
         "matrix":                   matrix,
         "trends":                   trends,
@@ -567,9 +588,9 @@ if mode == "🔴 Streaming (polling)":
             with st.spinner(f"🧠 ML sur {total} posts…"):
                 _run_stream_ml(st.session_state.stream_buffer, stream_n_clusters)
 
-        has_ml    = st.session_state.stream_trends is not None
-        has_burst = (st.session_state.stream_alerts is not None
-                     and not st.session_state.stream_alerts.empty)
+        # ── FIX Bug 5 : use _df_is_available() instead of truthiness checks
+        has_ml    = _df_is_available(st.session_state.stream_trends)
+        has_burst = _df_is_available(st.session_state.stream_alerts)
         has_viral = st.session_state.stream_virality_model is not None
 
         k1, k2, k3, k4, k5 = st.columns(5)
@@ -667,13 +688,14 @@ if mode == "🔴 Streaming (polling)":
                 rf_s       = st.session_state.stream_rf
                 mat_s      = st.session_state.stream_matrix
                 acc_s      = st.session_state.stream_cv_acc
-                alerts_s   = st.session_state.stream_alerts if st.session_state.stream_alerts is not None else pd.DataFrame()
-                scores_s   = st.session_state.stream_scores if st.session_state.stream_scores is not None else pd.DataFrame()
+                # ── FIX Bug 5 : use explicit None checks instead of `or pd.DataFrame()`
+                alerts_s   = st.session_state.stream_alerts  if st.session_state.stream_alerts  is not None else pd.DataFrame()
+                scores_s   = st.session_state.stream_scores  if st.session_state.stream_scores  is not None else pd.DataFrame()
                 v_model_s  = st.session_state.stream_virality_model
                 v_scaler_s = st.session_state.stream_virality_scaler
 
                 # ── FIX Bug 3 (streaming) : guard si df_cls est None
-                if df_cls is None or (hasattr(df_cls, "empty") and df_cls.empty):
+                if df_cls is None or (isinstance(df_cls, pd.DataFrame) and df_cls.empty):
                     st.warning("⚠️ DataFrame ML non disponible. Attendez le prochain cycle ML.")
                     st.stop()
 
@@ -779,10 +801,11 @@ if mode == "🔴 Streaming (polling)":
                             else:
                                 st.info("Modèle RF non disponible.")
 
-                        # ── FIX Bug 3 (streaming RF) : vérifier colonnes avant classify
                         _has_text_s   = "text" in df_cls.columns
                         _has_vec_s    = vec_s is not None
-                        _has_trends_s = trends_s is not None and not trends_s.empty
+                        # ── FIX Bug 5 : isinstance check instead of truthiness on DataFrame
+                        _has_trends_s = (trends_s is not None and
+                                         not (isinstance(trends_s, pd.DataFrame) and trends_s.empty))
                         if _has_text_s and _has_vec_s and _has_trends_s and rf_s is not None:
                             try:
                                 _cls_s = classify_new_posts(df_cls["text"].tolist(), vec_s, rf_s, trends_s)
@@ -848,8 +871,10 @@ if mode == "🔴 Streaming (polling)":
 
                 with tab_visu:
                     try:
-                        # ── FIX Bug 3 (streaming Visu) : guard colonnes requises
-                        if "cluster" not in df_cls.columns or trends_s is None or trends_s.empty:
+                        # ── FIX Bug 5 : isinstance check instead of truthiness on DataFrame
+                        _trends_empty = (trends_s is None or
+                                         (isinstance(trends_s, pd.DataFrame) and trends_s.empty))
+                        if "cluster" not in df_cls.columns or _trends_empty:
                             st.warning("⚠️ Colonnes ML manquantes pour les visualisations. Attendez le prochain cycle ML.")
                         else:
                             st.plotly_chart(engagement_scatter(df_cls, trends_s), width="stretch")
@@ -895,9 +920,7 @@ if st.session_state.df is not None:
         _df  = st.session_state.df
         _dfc = st.session_state.df_clean
 
-        # ── FIX Bug 3 : ne pas silencieusement tomber sur _df brut
-        #    Si _dfc est None ou vide, afficher un message clair et arrêter
-        if _dfc is None or (hasattr(_dfc, "empty") and _dfc.empty):
+        if _dfc is None or (isinstance(_dfc, pd.DataFrame) and _dfc.empty):
             st.error(
                 "❌ Les données ML ne sont pas disponibles dans la session.\n\n"
                 "Cela peut arriver après un rechargement de page. "
@@ -910,8 +933,9 @@ if st.session_state.df is not None:
         _mat     = st.session_state.matrix
         _rf      = st.session_state.rf
         _cv_acc  = st.session_state.cv_acc
-        _alerts  = st.session_state.alerts_df  if st.session_state.alerts_df  is not None else pd.DataFrame()
-        _scores  = st.session_state.scores_df  if st.session_state.scores_df  is not None else pd.DataFrame()
+        # ── FIX Bug 5 : explicit None checks instead of `or pd.DataFrame()`
+        _alerts  = st.session_state.alerts_df if st.session_state.alerts_df is not None else pd.DataFrame()
+        _scores  = st.session_state.scores_df if st.session_state.scores_df is not None else pd.DataFrame()
         _vm      = st.session_state.virality_model
         _vs      = st.session_state.virality_scaler
         _vf1     = st.session_state.virality_f1
@@ -923,7 +947,6 @@ if st.session_state.df is not None:
                                             "post_count", "avg_score",
                                             "avg_comments", "engagement_score"])
 
-        # ── FIX Bug 3 : vérifier que les colonnes ML sont bien présentes dans _dfc
         _missing_ml_cols = [c for c in ["cluster", "clean_text"] if c not in _dfc.columns]
         if _missing_ml_cols:
             st.warning(
@@ -962,7 +985,6 @@ if st.session_state.df is not None:
 
     st.divider()
 
-    # ── Création des tabs
     _tab1, _tab2, _tab3, _tab4, _tab5, _tab6 = st.tabs([
         "🔥 Tendances", "⚡ Bursts", "🔥 Viralité",
         "🌲 Random Forest", "🗺️ Géo / NER", "🗂️ Données"
@@ -988,7 +1010,6 @@ if st.session_state.df is not None:
                     st.info("Aucun flair ni hashtag détecté.")
             st.plotly_chart(timeline_chart(_df), width="stretch")
 
-            # ── FIX Bug 3 : guard colonne "cluster" avant engagement_scatter
             if "cluster" in _dfc.columns and not _trends.empty:
                 st.plotly_chart(engagement_scatter(_dfc, _trends), width="stretch")
             else:
@@ -1157,10 +1178,11 @@ if st.session_state.df is not None:
                     else:
                         st.info("Vectorizer non disponible.")
 
-                # ── FIX Bug 3 : guard complet avant classify_new_posts
-                _has_text   = "text"    in _dfc.columns
-                _has_vec    = _vec      is not None
-                _has_trends = _trends   is not None and not _trends.empty
+                _has_text   = "text"  in _dfc.columns
+                _has_vec    = _vec    is not None
+                # ── FIX Bug 5 : isinstance check instead of truthiness on DataFrame
+                _has_trends = (_trends is not None and
+                               not (isinstance(_trends, pd.DataFrame) and _trends.empty))
 
                 if _has_text and _has_vec and _has_trends:
                     try:
@@ -1193,12 +1215,9 @@ if st.session_state.df is not None:
         try:
             st.subheader("🗺️ Carte géographique des lieux mentionnés")
 
-            # ── Diagnostic : afficher toutes les colonnes NER détectées dans le df
-            # (les noms peuvent varier selon preprocess.py : ner_locations vs locations, etc.)
             _all_ner_candidates = [c for c in _dfc.columns if "ner" in c.lower() or
                                    any(k in c.lower() for k in ["loc", "person", "org", "gpe", "entity"])]
 
-            # Noms canoniques + variantes possibles selon les versions de preprocess.py
             _NER_COL_MAP = {
                 "ner_locations": ["ner_locations", "locations", "ner_loc", "loc", "GPE", "gpe"],
                 "ner_persons":   ["ner_persons",   "persons",   "ner_per", "per", "PERSON", "person"],
@@ -1206,7 +1225,6 @@ if st.session_state.df is not None:
             }
 
             def _resolve_ner_col(candidates):
-                """Retourne la première colonne présente et non-vide dans _dfc."""
                 for c in candidates:
                     if c in _dfc.columns and _dfc[c].notna().any():
                         return c
@@ -1217,7 +1235,6 @@ if st.session_state.df is not None:
             _col_org = _resolve_ner_col(_NER_COL_MAP["ner_orgs"])
             _has_ner = any([_col_loc, _col_per, _col_org])
 
-            # Expander de diagnostic toujours visible pour aider au debug
             with st.expander("🔬 Diagnostic colonnes NER (debug)", expanded=not _has_ner):
                 st.write("**Colonnes NER détectées dans le DataFrame :**",
                          _all_ner_candidates if _all_ner_candidates else "Aucune")
@@ -1305,10 +1322,24 @@ if st.session_state.df is not None:
 # ─── Classifieur ad hoc (sidebar) ────────────────────────────────────────────
 
 if classify_btn and custom_text.strip():
-    models   = load_models()
-    rf_m     = st.session_state.stream_rf or st.session_state.rf or (models["rf"] if models else None)
-    vec_m    = st.session_state.stream_vectorizer or st.session_state.vectorizer or (models["vectorizer"] if models else None)
-    trends_m = st.session_state.stream_trends or st.session_state.trends
+    models = load_models()
+
+    # ── FIX Bug 5 : replace all `or` chains involving possible DataFrames
+    #    with _first_not_none() which uses explicit `is not None` checks.
+    rf_m = _first_not_none(
+        st.session_state.stream_rf,
+        st.session_state.rf,
+        models["rf"] if models else None,
+    )
+    vec_m = _first_not_none(
+        st.session_state.stream_vectorizer,
+        st.session_state.vectorizer,
+        models["vectorizer"] if models else None,
+    )
+    trends_m = _first_not_none(
+        st.session_state.stream_trends,
+        st.session_state.trends,
+    )
 
     if rf_m is None or vec_m is None:
         st.sidebar.warning("Aucun modèle disponible. Lancez d'abord une analyse.")
@@ -1321,8 +1352,17 @@ if classify_btn and custom_text.strip():
             st.sidebar.success(f"**Sujet** : {row['topic_label']}")
             st.sidebar.metric("Confiance RF", f"{row['confidence']:.0%}")
 
-            v_m = st.session_state.stream_virality_model or st.session_state.virality_model or (models.get("virality_model") if models else None)
-            v_s = st.session_state.stream_virality_scaler or st.session_state.virality_scaler or (models.get("virality_scaler") if models else None)
+            # ── FIX Bug 5 : same _first_not_none pattern for virality models
+            v_m = _first_not_none(
+                st.session_state.stream_virality_model,
+                st.session_state.virality_model,
+                models.get("virality_model") if models else None,
+            )
+            v_s = _first_not_none(
+                st.session_state.stream_virality_scaler,
+                st.session_state.virality_scaler,
+                models.get("virality_scaler") if models else None,
+            )
 
             _pred_thr = st.session_state.effective_viral_threshold or int(viral_threshold)
 
