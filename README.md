@@ -7,7 +7,7 @@
 ![License](https://img.shields.io/badge/Licence-MIT-green?style=for-the-badge)
 ![Status](https://img.shields.io/badge/Status-En%20développement-yellow?style=for-the-badge)
 
-> Application web de détection et visualisation de tendances Twitter/X, propulsée par le Machine Learning (KMeans + TF-IDF).
+> Application web de détection et visualisation de tendances Reddit, propulsée par le Machine Learning (KMeans + TF-IDF).
 
 ---
 
